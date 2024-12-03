@@ -65,8 +65,23 @@ synthesis.openapi(route, async (c) => {
     token,
   } = c.req.valid("query");
 
-  if (c.env.TOKEN !== undefined && c.env.TOKEN !== "") {
-    if (token !== c.env.TOKEN) {
+  function getToken() {
+    if (
+      typeof globalThis.process !== "undefined" &&
+      globalThis.process.env.TOKEN !== undefined
+    ) {
+      return globalThis.process.env.TOKEN;
+    }
+    if (c.env.TOKEN !== undefined && c.env.TOKEN !== "") {
+      return c.env.TOKEN;
+    }
+    return "";
+  }
+
+  const systemToken = getToken();
+
+  if (systemToken !== "") {
+    if (token !== systemToken) {
       c.status(401);
       return c.text("Unauthorized");
     }
@@ -78,7 +93,7 @@ synthesis.openapi(route, async (c) => {
     throw new HTTPException(400, { message: `无效的音频格式：${format}` });
   }
   const ssml = buildSsml(text, { voiceName, pitch, rate, volume });
-  console.debug("SSML:", ssml);
+  DEBUG && console.debug("SSML:", ssml);
   try {
     const result = await retry(
       async () => {

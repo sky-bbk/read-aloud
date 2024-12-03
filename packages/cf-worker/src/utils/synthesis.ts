@@ -1,8 +1,3 @@
-import { randomBytes } from "node:crypto";
-
-// actually from "buffer" package, https://www.npmjs.com/package/buffer
-import { Buffer } from "isomorphic-buffer";
-
 export const FORMAT_CONTENT_TYPE = new Map([
   ["raw-16khz-16bit-mono-pcm", "audio/basic"],
   ["raw-48khz-16bit-mono-pcm", "audio/basic"],
@@ -37,16 +32,16 @@ export const FORMAT_CONTENT_TYPE = new Map([
 
 class SynthesisRequest {
   requestId: string;
-  buffer: Buffer;
-  successCallback: (buffer: Buffer) => void;
+  bufferChunks: Uint8Array[];
+  successCallback: (buffer: Uint8Array) => void;
   errorCallback: (error: Error) => void;
   constructor(
     requestId: string,
-    successCallback: (buffer: Buffer) => void,
+    successCallback: (buffer: Uint8Array) => void,
     errorCallback: (error: Error) => void,
   ) {
     this.requestId = requestId;
-    this.buffer = Buffer.from([]);
+    this.bufferChunks = [];
     this.successCallback = successCallback;
     this.errorCallback = errorCallback;
   }
@@ -65,27 +60,33 @@ class SynthesisRequest {
       },
     };
     const configMessage = `X-Timestamp:${Date()}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n${JSON.stringify(configData)}`;
-    console.debug(`Start to send config：${this.requestId}\n`, configMessage);
+    DEBUG &&
+      console.debug(`Start to send config：${this.requestId}\n`, configMessage);
     send(configMessage);
 
     // 发送SSML消息
     const ssmlMessage = `X-Timestamp:${Date()}\r\nX-RequestId:${this.requestId}\r\nContent-Type:application/ssml+xml\r\nPath:ssml\r\n\r\n${ssml}`;
-    console.debug(`Start to send SSML：${this.requestId}\n`, ssmlMessage);
+    DEBUG &&
+      console.debug(`Start to send SSML：${this.requestId}\n`, ssmlMessage);
     send(ssmlMessage);
   }
 
   handleString(data: string) {
     if (data.includes("Path:turn.start")) {
       // 开始传输
-      console.debug(`Turn Start：${this.requestId}……`);
+      DEBUG && console.debug(`Turn Start：${this.requestId}...`);
     } else if (data.includes("Path:turn.end")) {
       // 结束传输
-      console.debug(`Turn End：${this.requestId}……`);
-      this.successCallback(this.buffer);
+      DEBUG &&
+        console.debug(
+          `Turn End：${this.requestId} with ${this.bufferChunks.length} chunks...`,
+        );
+      const result = concatenate(this.bufferChunks);
+      this.successCallback(result);
     }
   }
-  handleBuffer(data: Buffer) {
-    this.buffer = Buffer.concat([this.buffer, data]);
+  handleBuffer(data: Uint8Array) {
+    this.bufferChunks.push(data);
   }
 }
 
@@ -95,26 +96,44 @@ function parseRequestId(data: string) {
   return matches?.groups?.id ?? null;
 }
 
-function handleMessage(message: MessageEvent) {
+// Path:audio\r\n
+const AUDIO_SEP = [80, 97, 116, 104, 58, 97, 117, 100, 105, 111, 13, 10];
+
+async function handleMessage(message: MessageEvent) {
   const data = message.data;
   switch (typeof data) {
     case "string": {
       const requestId = parseRequestId(data);
-      console.debug(`Received string (${requestId}): ${data}\n`);
+      DEBUG && console.debug(`Received string (${requestId}): ${data}\n`);
       return { requestId, data };
     }
     case "object": {
-      const bufferData = Buffer.from(data);
-      const separator = "Path:audio\r\n";
-      const contentIndex = bufferData.indexOf(separator) + separator.length;
-      const headers = bufferData.slice(2, contentIndex).toString();
-      const requestId = parseRequestId(headers);
-      console.debug(
-        `Received binary/audio (${requestId})：length: ${data.byteLength}`,
-      );
+      const bufferData = new Uint8Array(
+        // if run in node, data is a Blob, otherwise it's a ArrayBuffer
+        /*
+        Calling arrayBuffer() is not optimal, maybe reading from stream is better,
+        but it actually not a big deal, since we don't have a strict performance requirement
+        when running on Node
 
-      const content = bufferData.slice(contentIndex);
-      return { requestId, data: content };
+        On Cloudflare, data comes as ArrayBuffer, so even we want to read from stream,
+        we cannot. So the 10ms CPU limit is a problem.
+        */
+        data.constructor.name === "Blob"
+          ? await (data as unknown as Blob).arrayBuffer()
+          : data,
+      );
+      const contentIndex =
+        indexOfUint8Array(bufferData, AUDIO_SEP) + AUDIO_SEP.length;
+      const headers = new TextDecoder("utf-8").decode(
+        bufferData.subarray(2, contentIndex),
+      );
+      const requestId = parseRequestId(headers);
+      DEBUG &&
+        console.debug(
+          `Received binary/audio (${requestId})：length: ${bufferData.byteLength}`,
+        );
+
+      return { requestId, data: bufferData.subarray(contentIndex) };
     }
   }
 }
@@ -139,7 +158,7 @@ export class Service {
   }
 
   private async connect(): Promise<WebSocket> {
-    const connectionId = randomBytes(16).toString("hex").toLowerCase();
+    const connectionId = randomUUID().toLowerCase();
     const url = `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4&ConnectionId=${connectionId}`;
     const ws = new WebSocket(url);
     ws.addEventListener("close", (closeEvent) => {
@@ -154,10 +173,10 @@ export class Service {
       console.info(`Connection Closed： ${reason} ${code}`);
     });
 
-    ws.addEventListener("message", (message) => {
-      const { requestId, data } = handleMessage(message);
+    ws.addEventListener("message", async (message) => {
+      const { requestId, data } = await handleMessage(message);
       if (requestId == null) {
-        console.debug("Received unrecognized message");
+        DEBUG && console.debug("Received unrecognized message");
         return;
       }
       const request = this.requestMap.get(requestId);
@@ -166,7 +185,7 @@ export class Service {
           ? request.handleString(data)
           : request.handleBuffer(data);
       } else {
-        console.debug("Received message for unknown request");
+        DEBUG && console.debug("Received message for unknown request");
         return;
       }
     });
@@ -198,28 +217,28 @@ export class Service {
       this.ws = connection;
       console.info("Connected");
     }
-    const requestId = randomBytes(16).toString("hex").toLowerCase();
-    const result = new Promise<Buffer>((resolve, reject) => {
+    const requestId = randomUUID().toLowerCase();
+    const result = new Promise<Uint8Array>((resolve, reject) => {
       // 等待服务器返回后这个方法才会返回结果
       const request = new SynthesisRequest(requestId, resolve, reject);
       this.requestMap.set(requestId, request);
-      console.debug("Request received", requestId);
+      console.info("Request received", requestId);
       // 发送配置消息
       // biome-ignore lint/style/noNonNullAssertion: ws should be initialized above
       request.send(ssml, format, (data) => this.ws!.send(data));
     });
     // 收到请求，清除超时定时器
     if (this.timerId) {
-      console.debug("Received request, clearing timeout timer");
+      DEBUG && console.debug("Received request, clearing timeout timer");
       clearTimeout(this.timerId);
       this.timerId = undefined;
     }
     // 设置定时器，超过10秒没有收到请求，主动断开连接
-    console.debug("Creating timeout timer");
+    DEBUG && console.debug("Creating timeout timer");
     this.timerId = setTimeout(() => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.close(1000);
-        console.debug("Connection Closed by client due to inactivity");
+        DEBUG && console.debug("Connection Closed by client due to inactivity");
         this.timerId = undefined;
       }
     }, 10000);
@@ -238,4 +257,47 @@ export class Service {
     console.info(`${this.requestMap.size} tasks remaining`);
     return data;
   }
+}
+
+function randomUUID() {
+  return crypto.randomUUID().replaceAll("-", "");
+}
+
+function concatenate(uint8arrays: Uint8Array[]) {
+  const totalLength = uint8arrays.reduce(
+    (total, uint8array) => total + uint8array.byteLength,
+    0,
+  );
+
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const uint8array of uint8arrays) {
+    result.set(uint8array, offset);
+    offset += uint8array.byteLength;
+  }
+
+  return result;
+}
+
+function indexOfUint8Array(buffer: Uint8Array, separator: number[]) {
+  if (separator.length === 0) {
+    return 0;
+  }
+
+  const len = buffer.length - separator.length;
+  let i = 0;
+
+  outer: while (i <= len) {
+    if (buffer[i] === separator[0]) {
+      for (let j = 1; j < separator.length; j++) {
+        if (buffer[i + j] !== separator[j]) {
+          i++;
+          continue outer;
+        }
+      }
+      return i;
+    }
+    i++;
+  }
+  return -1;
 }
